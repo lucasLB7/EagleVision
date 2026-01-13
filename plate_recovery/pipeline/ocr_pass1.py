@@ -1,110 +1,151 @@
-# pipeline/ocr_pass1.py
 from __future__ import annotations
 
-import re
+from typing import Dict
 from collections import defaultdict
-from typing import Dict, List
 
 from config import AppConfig
-from .models import PlateObservation, OCRItem, OCRTrackResult
+from pipeline.models import PlateObservation, OCRItem, OCRTrackResult
+
+import re
+
+PLATE_RE = re.compile(r"^[A-Z]{3}[0-9]{3}[A-Z]$")
+
+# common OCR confusions
+CONFUSIONS = {
+    "0": "O", "O": "0",
+    "1": "I", "I": "1", "L": "1",
+    "2": "Z", "Z": "2",
+    "4": "A", "A": "4",
+    "5": "S", "S": "5",
+    "8": "B", "B": "8",
+}
+
+def _normalize_for_plate(t: str) -> str:
+    """Uppercase and keep only A–Z/0–9 (OCR cleanup)."""
+    t = t.upper()
+    return "".join(c for c in t if c.isalnum())
 
 
-PLATE_CLEAN_RE = re.compile(r"[^A-Z0-9]+")
-
-
-def _normalize_text(s: str) -> str:
-    s = s.upper().strip()
-    s = PLATE_CLEAN_RE.sub("", s)
-    return s
-
-
-def ocr_first_pass(selected: list[PlateObservation], cfg: AppConfig) -> Dict[int, OCRTrackResult]:
+def _plate_score(t: str) -> float:
     """
-    V1:
-    - run OCR on each selected rectified image
-    - return per-track best guess (simple confidence max)
-    Later:
-    - character-level probabilities + aggregation + priors
+    Score how well a string matches Kenyan plate shape: LLLDDDL (7 chars).
+    Higher is better.
     """
-    engine = cfg.ocr_engine.lower()
-    if engine == "easyocr":
-        return _easyocr_pass(selected, cfg)
-    elif engine == "paddleocr":
-        return _paddleocr_pass(selected, cfg)
-    else:
-        raise ValueError(f"Unknown OCR engine: {cfg.ocr_engine}")
+    t = _normalize_for_plate(t)
+
+    # perfect match gets a strong bonus
+    if PLATE_RE.match(t):
+        return 2.0
+
+    # only score 7-char candidates; reject others
+    if len(t) != 7:
+        return -1.0
+
+    score = 0.0
+    for i, ch in enumerate(t):
+        want_letter = i in (0, 1, 2, 6)
+        want_digit = i in (3, 4, 5)
+
+        if want_letter and ch.isalpha():
+            score += 0.25
+        elif want_digit and ch.isdigit():
+            score += 0.25
+        else:
+            # allow common OCR confusions as partial credit
+            score += 0.10 if ch in CONFUSIONS else -0.20
+
+    return score
 
 
-def _easyocr_pass(selected: list[PlateObservation], cfg: AppConfig) -> Dict[int, OCRTrackResult]:
-    # Lazy import so the project runs even if OCR libs not installed yet.
+# ---------- public entry point (THIS is what main.py imports) ----------
+def ocr_first_pass(
+    selected: list[PlateObservation],
+    cfg: AppConfig,
+) -> Dict[int, OCRTrackResult]:
+    return _easyocr_pass(selected, cfg)
+
+
+# ---------- internal implementation ----------
+def _easyocr_pass(
+    selected: list[PlateObservation],
+    cfg: AppConfig,
+) -> Dict[int, OCRTrackResult]:
     import easyocr
 
     reader = easyocr.Reader(list(cfg.ocr_langs), gpu=False)
-
     by_track: dict[int, list[OCRItem]] = defaultdict(list)
 
-    for obs in selected:
-        # easyocr returns list of (bbox, text, conf)
-        res = reader.readtext(obs.rectified)
-        if not res:
+    DEBUG_EVERY = 25
+    MIN_LEN = 3  # drop junk partials like "1", "424", "42A"
+
+    for i, obs in enumerate(selected):
+        img = obs.rectified
+        raw = reader.readtext(img, detail=1, paragraph=False)
+
+        if i % DEBUG_EVERY == 0:
+            print(
+                f"[easyocr] track={obs.track_id} frame={obs.frame_index} "
+                f"q={obs.quality:.3f} raw={raw[:3]}"
+            )
+
+        if not raw:
             continue
-        # take best line
-        best = max(res, key=lambda x: float(x[2]))
+
+        # choose highest-confidence line from EasyOCR output
+        best = max(raw, key=lambda x: float(x[2]))
         text = _normalize_text(str(best[1]))
         conf = float(best[2])
 
-        if text:
-            by_track[obs.track_id].append(
-                OCRItem(
-                    track_id=obs.track_id,
-                    frame_index=obs.frame_index,
-                    quality=obs.quality,
-                    text=text,
-                    confidence=conf,
-                )
-            )
-
-    return _pack_results(by_track)
-
-
-def _paddleocr_pass(selected: list[PlateObservation], cfg: AppConfig) -> Dict[int, OCRTrackResult]:
-    from paddleocr import PaddleOCR
-
-    ocr = PaddleOCR(use_angle_cls=True, lang="en")  # keep simple for now
-    by_track: dict[int, list[OCRItem]] = defaultdict(list)
-
-    for obs in selected:
-        out = ocr.ocr(obs.rectified, cls=True)
-        if not out or not out[0]:
+        if len(text) < MIN_LEN:
             continue
-        # out[0] is list of [bbox, (text, conf)]
-        best = max(out[0], key=lambda x: float(x[1][1]))
-        text = _normalize_text(str(best[1][0]))
-        conf = float(best[1][1])
-        if text:
-            by_track[obs.track_id].append(
-                OCRItem(
-                    track_id=obs.track_id,
-                    frame_index=obs.frame_index,
-                    quality=obs.quality,
-                    text=text,
-                    confidence=conf,
-                )
+
+        by_track[obs.track_id].append(
+            OCRItem(
+                track_id=obs.track_id,
+                frame_index=obs.frame_index,
+                quality=obs.quality,
+                text=text,
+                confidence=conf,
             )
+        )
 
     return _pack_results(by_track)
+
+
+
+# ---------- helpers ----------
+def _normalize_text(t: str) -> str:
+    t = t.upper()
+    t = "".join(c for c in t if c.isalnum())
+    return t
 
 
 def _pack_results(by_track: dict[int, list[OCRItem]]) -> Dict[int, OCRTrackResult]:
-    results: dict[int, OCRTrackResult] = {}
-    for tid, items in by_track.items():
-        items.sort(key=lambda x: (x.confidence, x.quality), reverse=True)
-        if items:
-            best = items[0]
-            results[tid] = OCRTrackResult(
-                track_id=tid,
-                best_text=best.text,
-                confidence=best.confidence,
-                items=items,
-            )
+    results: Dict[int, OCRTrackResult] = {}
+
+    for track_id, items in by_track.items():
+        if not items:
+            continue
+
+        def rank(it: OCRItem) -> float:
+            # normalize for plate scoring
+            t = _normalize_for_plate(it.text)
+            # combine OCR confidence + patch quality + plate-shape score
+            return (0.65 * it.confidence) + (0.20 * it.quality) + (0.15 * _plate_score(t))
+
+        best = max(items, key=rank)
+
+        results[track_id] = OCRTrackResult(
+            track_id=track_id,
+            best_text=best.text,
+            confidence=best.confidence,
+            items=sorted(items, key=lambda x: rank(x), reverse=True),
+        )
+
+    if not results:
+        print("OCR produced no results.")
+
+    return results
+
+
     return results
